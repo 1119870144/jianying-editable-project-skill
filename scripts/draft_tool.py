@@ -9,6 +9,8 @@ import time
 import uuid
 from pathlib import Path
 
+from material_registry import align_official_fonts, check_media_registry, register_local_media
+
 
 MODES = {"render_index_track_mode_on": True, "mixed_track_mode_on": True}
 
@@ -90,6 +92,8 @@ def compact_tracks(tracks):
 
 def write_bundle(folder, draft, meta):
     now = int(time.time() * 1_000_000)
+    meta['draft_fold_path'] = str(folder)
+    register_local_media(draft, meta)
     save(folder / "draft_content.json", draft)
     save(folder / "Timelines" / draft["id"] / "draft_content.json", draft)
     save(folder / "Timelines/project.json", {
@@ -150,12 +154,17 @@ def build(manifest_path, output, compact=False):
             if k == "text":
                 style = {**manifest.get("text_style", {}), **track.get("text_style", {}), **item.get("style", {})}
                 font_path = style.pop("font", manifest.get("font"))
+                resource = style.pop("font_resource", manifest.get("font_resource"))
                 require(font_path is not None, "Supply a real local font file for native text")
+                if resource is not None:
+                    require(all(isinstance(resource.get(k), str) and resource[k] for k in ("id", "path", "title")),
+                            "Official font needs an observed id, path and title")
+                    resource = {**resource, "path": str((manifest_path.parent / resource["path"]).resolve())}
                 shadow = style.pop("shadow", None)
                 require(isinstance(item["text"], str) and bool(item["text"]), "Empty native text")
                 segment = jy.TextSegment(item["text"], timerange, style=jy.TextStyle(**style),
                     clip_settings=settings, shadow=jy.TextShadow(**shadow) if shadow else None)
-                fonts[segment.material_id] = asset(font_path)
+                fonts[segment.material_id] = (asset(font_path), resource)
                 known_speeds[segment.speed.global_id] = segment.speed.export_json()
                 track_type = jy.TrackType.text
             else:
@@ -195,11 +204,18 @@ def build(manifest_path, output, compact=False):
             segment.update(render_index=index, track_render_index=index)
     materials = draft["materials"]
     for material in materials.get("texts", []):
-        path = fonts[material["id"]]
+        path, resource = fonts[material["id"]]
+        resource_id = resource["id"] if resource else ""
         content = json.loads(material["content"])
         for style in content["styles"]:
-            style["font"] = {"id": "", "path": path}
-        material.update(content=json.dumps(content, ensure_ascii=False), font_path=path, font_resource_id="", fonts=[])
+            style["font"] = {"id": resource_id, "path": path}
+        material.update(content=json.dumps(content, ensure_ascii=False), font_path=path,
+                        font_resource_id=resource_id, fonts=[])
+        if resource:
+            material["font_name"] = resource["title"]
+            material["fonts"] = [{"id": uid(), "resource_id": resource_id, "effect_id": resource_id,
+                                  "source_platform": 1, "path": resource["path"], "title": resource["title"]}]
+    align_official_fonts(draft)
     ids = {m["id"] for values in materials.values() for m in values if isinstance(m, dict) and "id" in m}
     materials.setdefault("speeds", []).extend(value for key, value in known_speeds.items() if key not in ids)
     # Observed local-media defaults in Jianying 11.6; not official capability bits.
@@ -258,16 +274,32 @@ def check(folder):
             require(path.is_file() and folder in path.parents, f"Missing or external asset: {value}")
 
     for material in materials.values():
-        for key in ("path", "font_path"):
-            bundled_file(material.get(key))
+        bundled_file(material.get("path"))
+        official = material.get("font_resource_id") if material.get("type") == "text" else None
+        if not official:
+            bundled_file(material.get("font_path"))
         if material.get("type") == "text":
             content = json.loads(material["content"])
             require(isinstance(content["text"], str) and bool(content["text"]), "Empty native text")
+            if official:
+                path = material.get("font_path")
+                registered = material.get("fonts", [])
+                require(path and Path(path).is_file() and len(registered) == 1 and
+                        registered[0].get("resource_id") == registered[0].get("effect_id") == official and
+                        Path(registered[0].get("path", "")).resolve() == Path(path).resolve(),
+                        "Official font registration mismatch")
             for style in content.get("styles", []):
                 require(style.get("font", {}).get("path"), "Native text needs a local font path")
-                bundled_file(style["font"]["path"])
-            for font in material.get("fonts", []):
-                bundled_file(font.get("path"))
+                if official:
+                    require(style["font"].get("id") == official and
+                            Path(style["font"]["path"]).resolve() == Path(path).resolve(),
+                            "Official font inner/outer reference mismatch")
+                else:
+                    bundled_file(style["font"]["path"])
+            if not official:
+                for font in material.get("fonts", []):
+                    bundled_file(font.get("path"))
+    check_media_registry(draft, meta)
     segment_ids, track_ids = set(), set()
     for index, track in enumerate(draft["tracks"]):
         require(track["id"] not in track_ids, "Duplicate track ID")

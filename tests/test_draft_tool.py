@@ -50,8 +50,8 @@ class DraftChecks(unittest.TestCase):
                 self.draft = original
 
     def test_missing_or_external_asset(self):
-        self.draft["materials"]["videos"][0]["path"] = str(self.folder / "missing.mp4")
         self.write()
+        self.media.unlink()
         with self.assertRaisesRegex(ValueError, "asset"): tool.check(self.folder)
 
     def test_mirror_mismatch(self):
@@ -59,6 +59,48 @@ class DraftChecks(unittest.TestCase):
         mirror = self.folder / "Timelines/draft-id/draft_content.json"
         mirror.write_text("{}")
         with self.assertRaisesRegex(ValueError, "mirror"): tool.check(self.folder)
+
+    def test_official_font_references_survive_install_and_reject_drift(self):
+        cached = self.folder.parent / "official.ttf"
+        cached.write_bytes(b"font validator fixture")
+        text = {"id": "text", "type": "text", "font_resource_id": "123", "font_path": str(cached),
+                "fonts": [{"resource_id": "123", "effect_id": "123", "path": str(cached)}],
+                "content": json.dumps({"text": "Title", "styles": [{"font": {"id": "123", "path": str(cached)}}]})}
+        self.draft["materials"]["texts"] = [text]
+        self.write()
+        result = tool.install(self.folder, self.folder.parent, "official-installed")
+        self.assertTrue(result["structure_verified"])
+        original = copy.deepcopy(text)
+        for issue in ("inner_id", "inner_path", "registry_id", "missing_cache"):
+            with self.subTest(issue=issue):
+                text = copy.deepcopy(original)
+                content = json.loads(text["content"])
+                if issue == "inner_id": content["styles"][0]["font"]["id"] = "wrong"
+                if issue == "inner_path": content["styles"][0]["font"]["path"] = str(self.media)
+                if issue == "registry_id": text["fonts"][0]["resource_id"] = "wrong"
+                if issue == "missing_cache": cached.unlink()
+                text["content"] = json.dumps(content)
+                self.draft["materials"]["texts"] = [text]
+                self.write()
+                with self.assertRaisesRegex(ValueError, "Official font"): tool.check(self.folder)
+
+    def test_build_aligns_verified_official_font_and_rejects_substitution(self):
+        font, cached = self.folder / "font.ttf", self.folder.parent / "cache.ttf"
+        font.write_bytes(b"identical font fixture")
+        cached.write_bytes(font.read_bytes())
+        manifest = {"width": 360, "height": 640, "font": str(font),
+                    "font_resource": {"id": "123", "path": str(cached), "title": "Fixture"},
+                    "tracks": [{"type": "mixed", "clips": [{"kind": "text", "text": "Title", "start": 0, "end": 1}]}]}
+        path, output = self.folder / "manifest.json", self.folder.parent / "built"
+        tool.save(path, manifest)
+        self.assertTrue(tool.build(path, output)["structure_verified"])
+        text = tool.read(output / "draft_content.json")["materials"]["texts"][0]
+        self.assertEqual(text["font_path"], str(cached))
+        self.assertEqual(json.loads(text["content"])["styles"][0]["font"]["id"], "123")
+        self.assertTrue(list((output / "materials").glob("*.ttf")))
+        cached.write_bytes(b"different font")
+        with self.assertRaisesRegex(ValueError, "identity"):
+            tool.build(path, self.folder.parent / "rejected")
 
     def test_install_keeps_source_and_rejects_overwrite(self):
         self.write()

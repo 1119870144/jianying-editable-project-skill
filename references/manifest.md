@@ -32,6 +32,18 @@
 
 文字风格合并顺序：全局 `text_style` → 轨道 `text_style` → 片段 `style`。字体可在 `style.font` 覆盖。字体文件必须存在；字体显示名称不能代替字库。样式参数使用库的 `TextStyle`：`size`、`bold`、`color`、`alpha`、`align`、`auto_wrapping` 等，`shadow` 对应 `TextShadow`。字号不是屏幕像素，需在剪映里校对。
 
+剪映官方字体增加全局 `font_resource`，或在上述文字风格层级中覆盖：
+
+```json
+"font_resource": {
+  "id": "从真实原生样本读取的资源ID",
+  "path": "该电脑剪映实际缓存目录/字体.ttf",
+  "title": "剪映实际字体名称"
+}
+```
+
+`font` 仍指向需要打包备份的字库；构建器只在它与 `font_resource.path` 的 SHA256 相同时对齐官方引用。资源信息来自真实样本，不能仅凭字库名称编造。官方缓存路径可以位于工程外，但须存在且登记、富文本内层、文字外层的资源 ID/路径一致；普通媒体和非官方字体仍须位于工程内。缓存不随 Skill 分发，另一台电脑先下载同一官方字体并使用那台电脑的路径。改用本地字体时将 `font_resource` 显式设为 `null`，保留字库并另行测试云端；不默认将本地字体换为系统同名字体。
+
 `clip` 使用 `ClipSettings` 的 `transform_x/y`、`scale_x/y`、`rotation`、`alpha`、`flip_horizontal/vertical`。本工作流画布像素位置转为 `x=(px-W/2)/(W/2)`，`y=(H/2-py)/(H/2)`。字幕的实际视觉中心仍受字形和行高影响。
 
 可视片段可写原生关键帧，例如：
