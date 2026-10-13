@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+work/
+*.skill
+*.mp4
+*.mov
+*.wav
+*.ttf
+*.otf
+*.ttc
+draft_content.json
+draft_meta_info.json
+.env
+.env.*

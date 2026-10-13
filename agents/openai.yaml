@@ -1,0 +1,6 @@
+interface:
+  display_name: "剪映可编辑工程"
+  short_description: "将视频方案和素材转成原生字幕、独立图层、自由混排的剪映工程"
+  default_prompt: "使用 $jianying-editable-project，把当前视频方案和素材生成可继续手动精修的新剪映工程。"
+policy:
+  allow_implicit_invocation: true
