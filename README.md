@@ -58,7 +58,7 @@ python scripts/draft_tool.py check work/DemoDraft
 python scripts/package_skill.py
 ```
 
-合成样例包含同排文字、图片、空档、视频、可删除的空副轨、SRT 和独立音频。FFmpeg 只供样例生成和转码使用。样例未包含真实人脸，不能验证美颜；宿主中的分割、美颜、预览和导出仍需实际核对。
+合成样例包含同排文字、图片、空档、视频、可删除的空副轨、SRT 和独立音频。FFmpeg 只供样例生成和转码使用。普通转换把已剪好视频对应的制作源码、分层素材和 SRT 直接生成并校验为新草稿，不重新剪辑，不打开或采集剪映窗口；完成后提示用户重启剪映检查新草稿。样例未包含真实人脸，不能验证美颜；仅在用户要求软件内验收或排查已报告故障时，实际核对相关的分割、美颜、预览或导出。未做的软件检查标为未验证，不阻塞普通草稿交付。
 
 `dist/jianying-editable-project.skill` 是带顶层技能目录的 ZIP 包，也可改扩展名为 `.zip` 后解压，把整个 `jianying-editable-project` 文件夹放入实际 Skill 根目录。GitHub 私有 Release 同时提供包与 SHA256。打包采用明确文件范围，排除 `work`、`.git`、缓存、依赖环境和真实媒体。更新时 `git pull` 后使用与首次相同的安装命令。
 
