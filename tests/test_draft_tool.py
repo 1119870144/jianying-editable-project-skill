@@ -1,4 +1,5 @@
 import copy
+import base64
 import json
 import sys
 import tempfile
@@ -101,6 +102,26 @@ class DraftChecks(unittest.TestCase):
         cached.write_bytes(b"different font")
         with self.assertRaisesRegex(ValueError, "identity"):
             tool.build(path, self.folder.parent / "rejected")
+
+    def test_builder_uses_source_clock_and_completes_partial_geometry(self):
+        # A real PNG keeps this regression independent of ffmpeg installations.
+        png = self.folder / "pixel.png"
+        png.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jG3sAAAAASUVORK5CYII="))
+        manifest = {"width": 360, "height": 640, "tracks": [{"type": "mixed", "role": "person", "clips": [
+            {"kind": "image", "path": str(png), "start": 2, "end": 3, "source_start": 5,
+             "clip": {"transform_y": -0.2}, "keyframes": [
+                 {"property": "position_x", "time": 0, "value": -0.2},
+                 {"property": "position_x", "time": 0.5, "value": 0}]}]}]}
+        path, output = self.folder / "manifest.json", self.folder.parent / "trimmed"
+        tool.save(path, manifest)
+        self.assertTrue(tool.build(path, output, compact=True)["geometry"]["geometry_verified"])
+        track = tool.read(output / "draft_content.json")["tracks"][0]
+        self.assertEqual(track["name"], "人物")
+        self.assertNotIn("role", track)
+        groups = {g["property_type"]: g["keyframe_list"] for g in track["segments"][0]["common_keyframes"]}
+        self.assertEqual([k["time_offset"] for k in groups["KFTypePositionX"]], [5_000_000, 5_500_000])
+        self.assertEqual(groups["KFTypePositionY"][0]["values"], [-0.2])
+        self.assertEqual(groups["KFTypePositionY"][0]["time_offset"], 5_000_000)
 
     def test_install_keeps_source_and_rejects_overwrite(self):
         self.write()

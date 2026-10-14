@@ -3,13 +3,19 @@ import argparse
 import copy
 import json
 import math
+import os
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
 
 from material_registry import align_official_fonts, check_media_registry, register_local_media
+from keyframe_integrity import normalize_geometry, validate_geometry
+from resource_bundle import create_resource_bundle, validate_resource_bundle
+from timeline_checks import check_timeline
+from track_layout import compact_tracks, NAMES
 
 
 MODES = {"render_index_track_mode_on": True, "mixed_track_mode_on": True}
@@ -73,24 +79,8 @@ def overlaps(a, b):
     return max(a.get("start", 0), b.get("start", 0)) < min(a.get("start", 0) + a["duration"], b.get("start", 0) + b["duration"])
 
 
-def compact_tracks(tracks):
-    """For newly built tracks only; preserve every concurrent visual z-order."""
-    placed, lanes = [], []
-    for track in tracks:
-        if track["type"] == "audio":
-            continue
-        for segment in track["segments"]:
-            lane = max((z + 1 for other, z in placed if overlaps(segment, other)), default=0)
-            while len(lanes) <= lane:
-                lanes.append({"id": uid(), "type": "mixed", "name": f"Visual {len(lanes)+1}", "is_default_name": False, "segments": []})
-            lanes[lane]["segments"].append(segment)
-            placed.append((segment, lane))
-    for lane in lanes:
-        lane["segments"].sort(key=lambda s: s["target_timerange"]["start"])
-    return lanes + [t for t in tracks if t["type"] == "audio"]
-
-
 def write_bundle(folder, draft, meta):
+    draft, geometry = normalize_geometry(draft)
     now = int(time.time() * 1_000_000)
     meta['draft_fold_path'] = str(folder)
     register_local_media(draft, meta)
@@ -106,6 +96,7 @@ def write_bundle(folder, draft, meta):
                 draft_root_path=str(folder.parent), draft_cover="", tm_duration=draft["duration"],
                 tm_draft_create=now, tm_draft_modified=now)
     save(folder / "draft_meta_info.json", meta)
+    save(folder / "geometry_report.json", geometry)
 
 
 def build(manifest_path, output, compact=False):
@@ -140,8 +131,11 @@ def build(manifest_path, output, compact=False):
     for lane_index, track in enumerate(tracks):
         kind = track.get("type", "mixed")
         require(kind in ("mixed", "audio"), "Tracks must be mixed or audio")
+        require(track.get("role") is None or (kind == "mixed" and track["role"] in NAMES), "Invalid visual track role")
         lane = {"id": uid(), "type": kind, "name": track.get("name", f"Track {lane_index+1}"),
                 "is_default_name": False, "segments": []}
+        if track.get("role"):
+            lane["role"] = track["role"]
         if track.get("srt"):
             asset(track["srt"])
         for item in sorted(track.get("clips", []), key=lambda c: c["start"]):
@@ -185,6 +179,8 @@ def build(manifest_path, output, compact=False):
                 require(k != "audio", "Visual keyframes cannot be applied to audio")
                 offset = round(keyframe["time"] * 1e6)
                 require(0 <= offset <= tr["duration"], "Keyframe outside clip")
+                if k != "text":
+                    offset = source["start"] + round(offset * source["duration"] / tr["duration"])
                 segment.add_keyframe(getattr(jy.KeyframeProperty, keyframe["property"]), offset, keyframe["value"])
             # Temporary typed tracks let the library register materials correctly.
             ref = script.append_track(jy.TrackSpec(track_type, uid()))
@@ -196,6 +192,8 @@ def build(manifest_path, output, compact=False):
     draft.update(id=uid(), name=output.name, **MODES, free_render_index_mode_on=False,
                  version=360000, new_version="189.0.0")
     draft["tracks"] = compact_tracks(exported_tracks) if compact else exported_tracks
+    for track in draft["tracks"]:
+        track.pop("role", None)
     visual = [t for t in draft["tracks"] if t["type"] != "audio"]
     require(visual and visual[0]["segments"], "First visual track must contain material; no empty main track")
     for index, track in enumerate(draft["tracks"]):
@@ -244,7 +242,7 @@ def build(manifest_path, output, compact=False):
     return check(output)
 
 
-def check(folder):
+def check(folder, home_index=None):
     folder = Path(folder).resolve()
     draft = read(folder / "draft_content.json")
     project = read(folder / "Timelines/project.json")
@@ -254,78 +252,25 @@ def check(folder):
     require([t["id"] for t in project["timelines"]] == [draft["id"]], "Only single-timeline bundles supported")
     require(read(folder / "Timelines" / draft["id"] / "draft_content.json") == draft, "Timeline mirror mismatch")
     meta = read(folder / "draft_meta_info.json")
-    require(meta["draft_id"] == draft["id"] and Path(meta["draft_fold_path"]).resolve() == folder, "Draft metadata mismatch")
-    visual = [t for t in draft["tracks"] if t["type"] != "audio"]
-    require(visual and all(t["type"] == "mixed" for t in visual), "Typed visual tracks prevent mixed placement")
-    mains = [t for t in visual if t.get("flag", 0) == 0]
-    require(len(mains) == 1 and mains[0] is visual[0] and mains[0].get("segments"), "Require one populated bottom main track")
-    require(all(t.get("flag") == 2 for t in visual[1:]), "Overlay tracks must use flag=2")
-    materials = {}
-    for values in draft["materials"].values():
-        for material in values:
-            if isinstance(material, dict) and "id" in material:
-                require(material["id"] not in materials, "Duplicate material ID")
-                require("draft" not in material, "Nested drafts require separate validation")
-                materials[material["id"]] = material
-
-    def bundled_file(value):
-        if value:
-            path = Path(value).resolve()
-            require(path.is_file() and folder in path.parents, f"Missing or external asset: {value}")
-
-    for material in materials.values():
-        bundled_file(material.get("path"))
-        official = material.get("font_resource_id") if material.get("type") == "text" else None
-        if not official:
-            bundled_file(material.get("font_path"))
-        if material.get("type") == "text":
-            content = json.loads(material["content"])
-            require(isinstance(content["text"], str) and bool(content["text"]), "Empty native text")
-            if official:
-                path = material.get("font_path")
-                registered = material.get("fonts", [])
-                require(path and Path(path).is_file() and len(registered) == 1 and
-                        registered[0].get("resource_id") == registered[0].get("effect_id") == official and
-                        Path(registered[0].get("path", "")).resolve() == Path(path).resolve(),
-                        "Official font registration mismatch")
-            for style in content.get("styles", []):
-                require(style.get("font", {}).get("path"), "Native text needs a local font path")
-                if official:
-                    require(style["font"].get("id") == official and
-                            Path(style["font"]["path"]).resolve() == Path(path).resolve(),
-                            "Official font inner/outer reference mismatch")
-                else:
-                    bundled_file(style["font"]["path"])
-            if not official:
-                for font in material.get("fonts", []):
-                    bundled_file(font.get("path"))
+    require(Path(meta["draft_fold_path"]).resolve() == folder, "Draft metadata folder mismatch")
+    # The app may assign a home-list ID independent of its timeline ID. Accept
+    # that only with a matching observed index entry; never force IDs back.
+    if meta["draft_id"] != draft["id"]:
+        if home_index is None:
+            home_index = Path(os.environ.get("LOCALAPPDATA", "")) / "JianyingPro/User Data/Projects/com.lveditor.draft/root_meta_info.json"
+        require(Path(home_index).is_file(), "Different home/timeline IDs need home-index evidence")
+        entries = read(home_index).get("all_draft_store", [])
+        matches = [row for row in entries if row.get("draft_id") == meta["draft_id"]]
+        require(len(matches) == 1 and matches[0].get("draft_name") == meta.get("draft_name") and
+                Path(matches[0].get("draft_fold_path", "")).resolve() == folder,
+                "Home-index evidence does not match metadata")
+    media_root = validate_resource_bundle(folder)
+    result = check_timeline(draft, folder, media_root, stable_media_only=media_root is not None)
     check_media_registry(draft, meta)
-    segment_ids, track_ids = set(), set()
-    for index, track in enumerate(draft["tracks"]):
-        require(track["id"] not in track_ids, "Duplicate track ID")
-        track_ids.add(track["id"])
-        end = 0
-        for segment in track.get("segments", []):
-            require(segment["id"] not in segment_ids, "Duplicate segment ID")
-            segment_ids.add(segment["id"])
-            r = segment["target_timerange"]
-            start, duration = r.get("start", 0), r["duration"]
-            require(start >= end and duration > 0, "Overlapping, unsorted or empty segment")
-            end = start + duration
-            require(end <= draft["duration"], "Segment exceeds draft duration")
-            require(all(abs(v*draft["fps"]/1e6-round(v*draft["fps"]/1e6)) < .001 for v in (start, end)), "Time is not frame aligned")
-            require(segment.get("track_render_index") == index and segment.get("render_index") == index, "Stale render index")
-            require(segment["material_id"] in materials, "Missing primary material")
-            require(all(ref in materials for ref in segment.get("extra_material_refs", [])), "Missing extra material reference")
-            material = materials[segment["material_id"]]
-            require((material["type"] in ("music", "audio", "extract_music")) == (track["type"] == "audio"), "Material on incompatible track")
-            if material["type"] in ("video", "music", "audio", "extract_music"):
-                src = segment["source_timerange"]
-                require(src.get("start", 0) >= 0 and src["duration"] > 0 and
-                        src.get("start", 0) + src["duration"] <= material["duration"] + 1000, "Source range exceeds media duration")
-    return {"structure_verified": True, "tracks": len(draft["tracks"]), "segments": len(segment_ids),
-            "native_texts": len(draft["materials"].get("texts", [])), "app_preview_verified": False,
-            "app_export_verified": False}
+    result["geometry"] = validate_geometry(draft)
+    result["rename_stable_resources_verified"] = media_root is not None
+    result["cloud_roundtrip_verified"] = False
+    return result
 
 
 def relocate(value, source, dest):
@@ -355,14 +300,31 @@ def install(source, root, name):
     check(source)
     draft = read(source / "draft_content.json")
     old_id = draft["id"]
-    # Copy only this tool's bundle files; do not carry caches or account data.
-    dest.mkdir()
-    shutil.copytree(source / "materials", dest / "materials")
-    draft = relocate(draft, source, dest)
+    old_resources = read(source / "resource_manifest.json") if (source / "resource_manifest.json").is_file() else None
+    resources = create_resource_bundle(source, root, str(uuid.uuid4()))
+    media_root = Path(resources["media_root"])
+    # Stage on the same volume outside the watched root. A complete directory is
+    # published in one rename; no main draft is rewritten after the app sees it.
+    stage = Path(tempfile.mkdtemp(prefix=".jianying-stage-", dir=root.parent))
+    shutil.copytree(source / "materials", stage / "materials")
+    meta = read(source / "draft_meta_info.json")
+    for previous in [source / "materials"] + ([Path(old_resources["media_root"])] if old_resources else []):
+        draft = relocate(draft, previous, media_root)
+        meta = relocate(meta, previous, media_root)
     draft.update(id=uid(), name=name)
-    write_bundle(dest, draft, relocate(read(source / "draft_meta_info.json"), source, dest))
-    result = check(dest)
-    result.update(path=str(dest), new_draft_id=draft["id"], source_draft_id=old_id)
+    save(stage / "resource_manifest.json", resources)
+    write_bundle(stage, draft, meta)
+    result = check(stage)
+    meta = read(stage / "draft_meta_info.json")
+    meta.update(draft_fold_path=str(dest), draft_root_path=str(root))
+    save(stage / "draft_meta_info.json", meta)
+    # Read-only diagnostic snapshot is never a substitute for a later saved or
+    # encrypted user timeline. It records paths for a future rename recovery.
+    save(stage / "delivery_snapshot.json", read(stage / "draft_content.json"))
+    require(not dest.exists(), f"Refusing to overwrite: {dest}")
+    stage.rename(dest)
+    result.update(path=str(dest), new_draft_id=draft["id"], source_draft_id=old_id,
+                  verification_phase="before_atomic_publish", media_root=str(media_root))
     return result
 
 
@@ -375,6 +337,7 @@ def main():
     b.add_argument("--compact", action="store_true")
     c = commands.add_parser("check")
     c.add_argument("folder", type=Path)
+    c.add_argument("--home-index", type=Path)
     i = commands.add_parser("install")
     i.add_argument("source", type=Path)
     i.add_argument("root", type=Path)
@@ -384,7 +347,7 @@ def main():
         if args.command == "build":
             result = build(args.manifest, args.output, args.compact)
         elif args.command == "check":
-            result = check(args.folder)
+            result = check(args.folder, args.home_index)
         else:
             result = install(args.source, args.root, args.name)
         print(json.dumps(result, ensure_ascii=False, indent=2))
